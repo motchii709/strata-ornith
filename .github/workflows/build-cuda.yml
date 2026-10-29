@@ -11,5 +11,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install CUDA Toolkit 13.2
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '13.2.2'
       - name: Probe
         run: Write-Output "runner ok"
