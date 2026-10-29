@@ -6,26 +6,47 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache build dir
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: build-sm75-${{ hashFiles('src/**', 'CMakeLists.txt', 'include/**') }}
+
       - name: Install CUDA Toolkit 13.2
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: '13.2.0'
+
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
+
       - name: Configure for sm_75 (GTX 1650)
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+
       - name: Build strata.exe
         run: cmake --build build --target strata -j4
+
       - name: Show binary
         run: Get-Item build\strata.exe
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: strata-cuda13-sm75
-          path: build/strata.exe
-          if-no-files-found: error
+
+      # the Actions artifact quota is exhausted (recalcs every 6-12h), so ship the exe as a release asset instead
+      - name: Publish engine as release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view engine-latest --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create engine-latest --repo $env:GITHUB_REPOSITORY --title "CUDA engine (sm_75)" --notes "strata.exe with IQ3_XXS expert-down kernels, built from $env:GITHUB_SHA"
+          } else {
+            gh release edit engine-latest --repo $env:GITHUB_REPOSITORY --notes "strata.exe with IQ3_XXS expert-down kernels, built from $env:GITHUB_SHA"
+          }
+          gh release upload engine-latest build\strata.exe --repo $env:GITHUB_REPOSITORY --clobber
