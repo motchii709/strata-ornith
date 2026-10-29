@@ -5,6 +5,9 @@
 #pragma once
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <psapi.h>
 #include <dbghelp.h>
@@ -30,7 +33,7 @@ inline void print_crash_stack(const char* why) {
     MODULEINFO mi{};
     const uintptr_t mbase = self && GetModuleInformation(GetCurrentProcess(), self, &mi, sizeof mi)
                                ? reinterpret_cast<uintptr_t> (mi.lpBaseOfDll) : 0;
-    const uintptr_t msize = mbase ? reinterpret_cast<uintptr_t> (mi.SizeOfImage) : 0;
+    const uintptr_t msize = mbase ? static_cast<uintptr_t> (mi.SizeOfImage) : 0;
     for (int i = 0; i < n; ++i) {
         const uintptr_t a = reinterpret_cast<uintptr_t> (fr[i]);
         if (mbase && a >= mbase && a < mbase + msize)
