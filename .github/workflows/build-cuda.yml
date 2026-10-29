@@ -30,7 +30,8 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Configure for sm_75 (GTX 1650)
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+        # /Zi + /DEBUG + /MAP: diagnostics only, the PDB and the map ride along so a crash offset can be named
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CXX_FLAGS_RELEASE="/O2 /Ob2 /DNDEBUG /Zi" -DCMAKE_EXE_LINKER_FLAGS_RELEASE="/DEBUG /MAP"
 
       - name: Build strata.exe
         run: cmake --build build --target strata -j4
@@ -49,4 +50,4 @@ jobs:
           } else {
             gh release edit engine-latest --repo $env:GITHUB_REPOSITORY --notes "strata.exe with IQ3_XXS expert-down kernels, built from $env:GITHUB_SHA"
           }
-          gh release upload engine-latest build\strata.exe --repo $env:GITHUB_REPOSITORY --clobber
+          gh release upload engine-latest build\strata.exe build\strata.pdb build\strata.map --repo $env:GITHUB_REPOSITORY --clobber
