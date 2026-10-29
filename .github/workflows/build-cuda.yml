@@ -1,10 +1,9 @@
-name: build-windows-cuda
-# dispatch may 422 until a later push re-registers the triggers (new-repo quirk)
-on:
-  workflow_dispatch:
-  push:
-    branches: [main]
-    paths: ['src/**', 'CMakeLists.txt', '.github/workflows/build-windows-cuda.yml']
+name: Build CUDA engine
+
+on: push
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -16,7 +15,6 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: '13.2.2'
-          method: network
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -28,7 +26,7 @@ jobs:
         run: cmake --build build --target strata -j4
 
       - name: Show binary
-        run: Get-Item build\strata.exe | Select-Object Name, Length
+        run: Get-Item build\strata.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
