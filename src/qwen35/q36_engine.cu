@@ -2905,10 +2905,36 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     {   // what the hybrid mode allocates next (the staging pair, the CPU part's outputs, the slots) against the VRAM the
         // sessions and the context left: said with the numbers instead of a cudaMalloc failure (8 slots on a 12 GB card)
         const size_t Tn = (size_t) E.tmax, Nn = (size_t) g.n_embd, Kn = (size_t) m.top_k;
-        size_t need = staging + Tn * Kn * Nn * 4 + Tn * Kn * 4;
-        for (Layer* L : all) {
-            if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
-            else need += (S > 0 ? (size_t) S * L->stride + kMmqTail : 0);
+        auto hybrid_need = [&]() {
+            size_t n = staging + Tn * Kn * Nn * 4 + Tn * Kn * 4;
+            for (Layer* L : all) {
+                if (mtp_only && L != &m.mtp) n += L->stride * (size_t) ne + kMmqTail;
+                else n += (S > 0 ? (size_t) S * L->stride + kMmqTail : 0);
+            }
+            return n;
+        };
+        size_t need = hybrid_need();
+        if (need > fr && E.kAttScoreFloats > ((size_t) 16 << 20) && std::getenv("STRATA_Q36_KEEP_ATT") == nullptr) {
+            // the fit does not close: give back the prompt attention's scores buffer, the one large allocation the
+            // check controls (the same shrink the all-in-VRAM path applies when the fit is close): 16 M floats instead
+            // of the build's default makes the prompt read attention in smaller slices and frees 6 bytes per float
+            // here - on a 4 GB card that difference is fit-or-not (STRATA_Q36_KEEP_ATT=1 keeps the large buffer)
+            const size_t old_floats = E.kAttScoreFloats;
+            E.shrink_att((size_t) 16 << 20);
+            CK(cudaMemGetInfo(&fr, &tot));
+            budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
+            slot_bytes = budget2 > staging ? budget2 - staging : 0;
+            if (slot_bytes + staging + ((size_t) 256 << 20) > fr)
+                slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
+            S = slots > 0 ? (int) std::min<int64_t>(ne, slots) : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot);
+            if (mtp_only) {
+                const size_t left = budget2 > total_main ? budget2 - total_main : 0;
+                S = (int) std::min<size_t>((size_t) ne, left / m.mtp.stride);
+            }
+            need = hybrid_need();
+            std::fprintf(stderr, "strata-q36: the prompt attention's scores buffer given back (%.0f MiB) for the hybrid "
+                         "buffers; the prompt reads attention in smaller slices now\n",
+                         (double) ((old_floats - ((size_t) 16 << 20)) * 6) / (1 << 20));
         }
         if (need > fr) {
             err = "not enough VRAM left for the hybrid experts' buffers and slots (" + std::to_string((need >> 20)) +
