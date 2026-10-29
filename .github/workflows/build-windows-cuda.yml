@@ -1,4 +1,5 @@
 name: build-windows-cuda
+# dispatch may 422 until a later push re-registers the triggers (new-repo quirk)
 on:
   workflow_dispatch:
   push:
