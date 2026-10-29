@@ -2918,10 +2918,19 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             // the fit does not close: give back the prompt attention's scores buffer, the one large allocation the
             // check controls (the same shrink the all-in-VRAM path applies when the fit is close): 16 M floats instead
             // of the build's default makes the prompt read attention in smaller slices and frees 6 bytes per float
-            // here - on a 4 GB card that difference is fit-or-not (STRATA_Q36_KEEP_ATT=1 keeps the large buffer)
+            // here - on a 4 GB card that difference is fit-or-not (STRATA_Q36_KEEP_ATT=1 keeps the large buffer).
+            // WDDM (Windows) often does not count the just-freed pages in cudaMemGetInfo's free, although the same
+            // context's next cudaMalloc reuses them: measure around the shrink and credit the share the reading
+            // does not show, so the check reflects the memory the process really owns (measured 2026-10-30, 4 GB
+            // card: free stayed 0 MiB after a 288 MiB give-back until credited)
             const size_t old_floats = E.kAttScoreFloats;
+            size_t fr_pre = 0;
+            CK(cudaMemGetInfo(&fr_pre, &tot));
             E.shrink_att((size_t) 16 << 20);
             CK(cudaMemGetInfo(&fr, &tot));
+            const size_t freed = (old_floats - ((size_t) 16 << 20)) * 6;
+            const size_t shown = fr > fr_pre ? fr - fr_pre : 0;
+            fr += freed - (shown < freed ? shown : freed);
             budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
             slot_bytes = budget2 > staging ? budget2 - staging : 0;
             if (slot_bytes + staging + ((size_t) 256 << 20) > fr)
@@ -2932,9 +2941,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                 S = (int) std::min<size_t>((size_t) ne, left / m.mtp.stride);
             }
             need = hybrid_need();
-            std::fprintf(stderr, "strata-q36: the prompt attention's scores buffer given back (%.0f MiB) for the hybrid "
-                         "buffers; the prompt reads attention in smaller slices now\n",
-                         (double) ((old_floats - ((size_t) 16 << 20)) * 6) / (1 << 20));
+            std::fprintf(stderr, "strata-q36: the prompt attention's scores buffer given back (%.0f MiB, %.0f MiB of it "
+                         "visible to cudaMemGetInfo) for the hybrid buffers; the prompt reads attention in smaller "
+                         "slices now\n", (double) freed / (1 << 20), (double) shown / (1 << 20));
         }
         if (need > fr) {
             err = "not enough VRAM left for the hybrid experts' buffers and slots (" + std::to_string((need >> 20)) +
