@@ -11,10 +11,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install CUDA Toolkit 13.3
+      - name: Install CUDA Toolkit 13.2
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: '13.3.1'
+          cuda: '13.2.0'
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
       - name: Configure for sm_75 (GTX 1650)
