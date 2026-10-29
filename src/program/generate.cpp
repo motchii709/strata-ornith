@@ -8554,8 +8554,8 @@ int main(int argc, char** argv) {
             // one falls back to the old rule, which takes the largest chunk whose ring clears kRingMin (the
             // value at or below which ring_slots() returns STAGE and streaming is off).
             constexpr int64_t kRingMin = 16;
-            const int64_t small = old_rule();   // 0.1.39's chunk (and its ring for the prompts that fit it)
-            const int64_t ring_max = strata::prefill::Prefill::ring_cap_for(small);
+            const int64_t old_chunk = old_rule();   // 0.1.39's chunk (and its ring for the prompts that fit it)
+            const int64_t ring_max = strata::prefill::Prefill::ring_cap_for(old_chunk);
             const int64_t budget = std::min(xcache.slots() - 128, kAutoLendPct * xcache.slots() / 100);
             // The room is a BYTE budget.  A ring slot is max_blob bytes (`carve` lays out one whole blob each),
             // while these cache slots hold their own layer's blob, which is smaller than max_blob unless the cache
@@ -8585,12 +8585,12 @@ int main(int argc, char** argv) {
             int64_t c = scan(ring_max);
             if (c == 0 && ring_max < strata::prefill::Prefill::ring_default_slots()) c = scan(kRingMin);
             // a prompt that fits 0.1.39's chunk keeps 0.1.39's ring (one chunk: the smaller ring only slowed it)
-            if (small >= c) {   // the scan bought nothing: 0.1.39's choice
+            if (old_chunk >= c) {   // the scan bought nothing: 0.1.39's choice
                 strata::prefill::Prefill::set_ring_budget(0, 0);
-                if (small > 0) { chunk = small; return slots_for(small); }
+                if (old_chunk > 0) { chunk = old_chunk; return slots_for(old_chunk); }
                 return 0;
             }
-            strata::prefill::Prefill::set_ring_budget((int) room_of(c), small);
+            strata::prefill::Prefill::set_ring_budget((int) room_of(c), old_chunk);
             chunk = c;
             return slots_for(c);
         }
@@ -9440,8 +9440,8 @@ int main(int argc, char** argv) {
                     return 0;
                 }
                 if (!strata::prefill::Prefill::ring_bytes_enabled()) return old_pick(only);   // STRATA_RING_BYTES=0
-                const int64_t small = old_pick(only);
-                const int64_t cap = strata::prefill::Prefill::ring_cap_for(small);
+                const int64_t old_pick_chunk = old_pick(only);
+                const int64_t cap = strata::prefill::Prefill::ring_cap_for(old_pick_chunk);
                 auto probe = [&](int64_t floor) -> int64_t {
                     return biggest_chunk(auto_ceiling, [&](int64_t t) -> bool {
                         const int64_t room = ring_room(t, only, cap);
@@ -9454,7 +9454,7 @@ int main(int argc, char** argv) {
                 };
                 int64_t c = probe(cap);
                 if (c == 0 && cap < strata::prefill::Prefill::ring_default_slots()) c = probe(kRingMin);
-                return std::max(c, small);   // never a smaller chunk than 0.1.39's
+                return std::max(c, old_pick_chunk);   // never a smaller chunk than 0.1.39's
             };
             int64_t chunk = scan(nullptr);
             // #448: a small card in a layer split caps every stage's chunk (an RTX 3080's 512-slot cache held a
@@ -9466,10 +9466,12 @@ int main(int argc, char** argv) {
             if (chunk > 0 && o.prefill_auto && strata::prefill::Prefill::ring_bytes_enabled()) {
                 // a prompt that fits 0.1.39's chunk keeps 0.1.39's ring (one chunk: the smaller ring only slowed
                 // it); the byte-budget ring is for the chunks past it
-                const int64_t small = old_pick(nullptr);
+                const int64_t old_pick_chunk = old_pick(nullptr);
                 strata::prefill::Prefill::set_ring_budget(
-                    small >= chunk ? 0 : (int) ring_room(chunk, nullptr, strata::prefill::Prefill::ring_cap_for(small)),
-                    small);
+                    old_pick_chunk >= chunk ? 0
+                                            : (int) ring_room(chunk, nullptr,
+                                                              strata::prefill::Prefill::ring_cap_for(old_pick_chunk)),
+                    old_pick_chunk);
             }
             // #2824: the VRAM pick, priced against the host (RAM left for the page cache, the displaced experts with no RAM
             // backup, the drive): a smaller chunk / ring when the file set the prompt re-reads outgrows the page cache.
