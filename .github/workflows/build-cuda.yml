@@ -7,13 +7,19 @@ on:
   workflow_dispatch:
 
 jobs:
-  probe:
+  build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install CUDA Toolkit 13.2
+      - name: Install CUDA Toolkit 13.3
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: '13.2.2'
-      - name: Probe
-        run: Write-Output "runner ok"
+          cuda: '13.3.1'
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Configure (sm_75 only: GTX 1650)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+      - name: Build strata.exe
+        run: cmake --build build --target strata -j4
+      - name: Show binary
+        run: Get-Item build\strata.exe
