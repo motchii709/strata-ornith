@@ -3907,8 +3907,16 @@ int strata::qwen35::run(int argc, char** argv) {
     E.draft_n = std::max(0, draft_vocab);
     E.bmtp = (batch_mtp || (std::getenv("STRATA_BATCH_MTP") != nullptr && std::string(std::getenv("STRATA_BATCH_MTP")) != "0")) && E.n_sess > 1 && E.mtp_d > 0;
     if (batch_mtp && !E.bmtp) std::fprintf(stderr, "strata-q36: --batch-mtp needs --batch N (2 or more) and --mtp N: ignored\n");
-    if (warm) E.warmup();
-    if (serve_mode) return serve(E);
+    try {
+        if (warm) E.warmup();
+        if (serve_mode) return serve(E);
+    } catch (const std::exception& e) {
+        // the kernels throw (native_router_topk et al) and nothing below here caught: a fast-fail without a
+        // message helps nobody - print the reason, then die the way a CUDA error would
+        std::fprintf(stderr, "strata-q36: an exception escaped the engine: %s\n", e.what());
+        std::fflush(stderr);
+        return 3;
+    }
     if (bench_pp > 0 || bench_tg > 0) {
         // llama-bench's shapes: a prompt of bench_pp tokens from a fresh state, then bench_tg tokens one at a time
         std::vector<int32_t> toks((size_t) std::max(bench_pp, 1));
