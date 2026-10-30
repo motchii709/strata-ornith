@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <psapi.h>
 #include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
