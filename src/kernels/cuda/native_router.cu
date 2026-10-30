@@ -233,7 +233,9 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
-bool native_router_topk_supported(int n_expert, int k) { return (n_expert == 512 && k == 10) || (n_expert == 256 && k == 8); }
+bool native_router_topk_supported(int n_expert, int k) {
+    return (n_expert == 512 && k == 10) || (n_expert == 256 && k == 8) || (n_expert == 256 && k == 4);
+}
 void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream) {
     if (n_expert == 512 && k == 10) {   // Flash-Next: the pinned kernels above, unchanged
         if (n_tok == 1) native_router_top10(logits, ids, weights, stream);
@@ -250,8 +252,14 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
                       stream, n_tok, n_expert, k, (const void*) logits, (const void*) ids, (const void*) weights);
         throw std::invalid_argument(msg);
     }
-    route_topk<256, 8><<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
-        logits, ids, weights, n_tok);
+    // Ornith's Heretic fine-tune of Qwen3.6-35B routes 4 of the 256 experts (the file's expert_used_count);
+    // the kernel template is shape-generic, only the instantiation is new
+    if (n_expert == 256 && k == 4)
+        route_topk<256, 4><<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+            logits, ids, weights, n_tok);
+    else
+        route_topk<256, 8><<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
+            logits, ids, weights, n_tok);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
