@@ -1,0 +1,31 @@
+name: ISA audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  audit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache build dir
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: build-sm75-${{ hashFiles('src/**', 'CMakeLists.txt', 'include/**') }}
+
+      - name: Report codegen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          "ISA audit for $env:GITHUB_SHA (cached build tree)" | Out-File codegen-report.txt -Encoding utf8
+          if (-not (Test-Path build\build.ninja)) { "NO CACHED build dir (configure never ran)" | Out-File codegen-report.txt -Encoding utf8; exit 0 }
+          $arch = Select-String -Path build\build.ninja -Pattern "/arch:"
+          "arch-flag lines: $($arch.Count)" | Out-File codegen-report.txt -Append -Encoding utf8
+          foreach ($l in $arch) { $s = $l.Line.Trim(); if ($s.Length -gt 200) { $s = $s.Substring(0, 200) }; $s | Out-File codegen-report.txt -Append -Encoding utf8 }
+          Select-String -Path build\CMakeCache.txt -Pattern "^GGML_" | Select-Object -First 40 | ForEach-Object { $_.Line } | Out-File codegen-report.txt -Append -Encoding utf8
+          gh release edit engine-latest --repo $env:GITHUB_REPOSITORY --notes-file codegen-report.txt
