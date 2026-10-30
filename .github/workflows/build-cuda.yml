@@ -31,7 +31,8 @@ jobs:
 
       - name: Configure for sm_75 (GTX 1650)
         # /Zi + /DEBUG + /MAP: diagnostics only, the PDB and the map ride along so a crash offset can be named
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CXX_FLAGS_RELEASE="/O2 /Ob2 /DNDEBUG /Zi" -DCMAKE_EXE_LINKER_FLAGS_RELEASE="/DEBUG /MAP"
+        # STRATA_PORTABLE=ON: the CPU kernels capped at AVX2 (the build host's AVX-512 objects 0xC000001D'd on the Ryzen 5 5500)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_PORTABLE=ON -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_CXX_FLAGS_RELEASE="/O2 /Ob2 /DNDEBUG /Zi" -DCMAKE_EXE_LINKER_FLAGS_RELEASE="/DEBUG /MAP"
 
       - name: Build strata.exe
         run: cmake --build build --target strata -j4
