@@ -242,8 +242,14 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
     }
     if (!stream || n_tok < 1 || !native_router_topk_supported(n_expert, k) ||
         !valid(logits, (size_t) n_tok * n_expert * 4) || !valid(ids, (size_t) n_tok * k * 4) ||
-        !valid(weights, (size_t) n_tok * k * 4))
-        throw std::invalid_argument("native_router_topk: a stream, a supported (experts, k) and aligned buffers");
+        !valid(weights, (size_t) n_tok * k * 4)) {
+        // the caller's values, so a rejection names its argument instead of listing every rule
+        char msg[176];
+        std::snprintf(msg, sizeof msg,
+                      "native_router_topk rejected: stream=%p n_tok=%d n_expert=%d k=%d logits=%p ids=%p weights=%p",
+                      stream, n_tok, n_expert, k, (const void*) logits, (const void*) ids, (const void*) weights);
+        throw std::invalid_argument(msg);
+    }
     route_topk<256, 8><<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(
         logits, ids, weights, n_tok);
     const auto error = cudaGetLastError();
