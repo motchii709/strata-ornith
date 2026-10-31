@@ -3038,6 +3038,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             }
         }
     }
+    // the staging buffers go up BEFORE the host work: the fit check (and its probe) just proved the driver can
+    // serve the need, and the pages are hot now - after the pinned arena's minutes of expert copies they scatter
+    // (measured 2026-11-01, 4 GB card: the staging's cudaMalloc failed out of memory right after a successful
+    // probe of a bigger block, with the arena's copies in between)
+    if (staging) {
+        CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
+        for (int b = 0; b < E.n_staging; ++b) {
+            CK(cudaMalloc(&E.stage[b], stage_layer + kMmqTail));
+            CK(cudaMemset(E.stage[b], 0, stage_layer + kMmqTail));
+            CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
+            CK(cudaEventRecord(E.ev_used[b], E.st));
+        }
+    }
     // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
     size_t host = 0;
     for (Layer* L : all)
@@ -3103,16 +3117,6 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     CK(cudaMalloc(&E.d_miss, T * Kp * 4));
     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
-    if (staging) {
-        CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
-        for (int b = 0; b < E.n_staging; ++b) {
-            CK(cudaMalloc(&E.stage[b], stage_layer + kMmqTail));
-            CK(cudaMemset(E.stage[b], 0, stage_layer + kMmqTail));
-            CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
-            CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
-            CK(cudaEventRecord(E.ev_used[b], E.st));
-        }
-    }
     E.pool = std::make_unique<C::ExpertPool>(threads);
     CK(cudaDeviceSynchronize());
     if (mtp_only)
