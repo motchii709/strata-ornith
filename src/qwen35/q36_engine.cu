@@ -1246,6 +1246,11 @@ struct Engine {
     int hybrid_t = 32;
     bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
     bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
+    /// STRATA_Q36_STAGING_MAIN_ONLY=1: the MTP block's prompt rows run on the CPU pool instead of the streamed
+    /// MMQ path, so the expert stream never queues the MTP layer and the staging is sized for the main layers
+    /// only (the MTP block's Q8_0 layer is the model's largest and would otherwise more than triple the
+    /// staging on a small card).
+    bool staging_main_only = false;
     /// state index li's layer runs hybrid (its experts not all in VRAM)
     bool lhy(size_t li) const {
         if (!m->hybrid) return false;
@@ -2009,7 +2014,8 @@ struct Engine {
         else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
         // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
         // (its prompt pass too: no staging buffers then)
-        const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
+        const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid ||
+                                         (staging_main_only && li == m->layers.size()));
         const bool mmq_rows = !hy_rows && T > kGemmT && use_mmq;
         if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T, ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
             K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
@@ -2137,7 +2143,10 @@ struct Engine {
     void forward_mtp(int T, int64_t p0, const float* seeds, bool draft, bool graph_mode) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq) stream_begin({(int) m->layers.size()});
+        // STRATA_Q36_STAGING_MAIN_ONLY=1: the MTP block's expert rows take the CPU pool (layer() routes them
+        // there), so the stream never queues the MTP layer.
+        if (!staging_main_only && main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq)
+            stream_begin({(int) m->layers.size()});
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(y, d_img, d_map, N);
         k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);              // [e | ...]
@@ -2172,6 +2181,11 @@ struct Engine {
         for (int i = 0; i < 2 && i < (int) seq.size(); ++i) stream_kick(i);
     }
     void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % 2, after its last reader
+        if (staging_main_only && stream_seq[(size_t) i] >= (int) m->layers.size()) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_STAGING_MAIN_ONLY sizes the staging for the main layers, "
+                         "but the MTP layer was queued for the stream\n");
+            std::exit(1);
+        }
         const int b = i % 2;
         const Layer& L = layer_at(stream_seq[(size_t) i]);
         CK(cudaStreamWaitEvent(cst, ev_used[b], 0));
@@ -2807,6 +2821,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         per_slot += L->stride;
         max_layer = std::max(max_layer, L->stride * (size_t) ne);
     }
+    size_t max_main = 0; // the main layers only: what the streamed prompt path can see (see staging_main_only)
+    for (const Layer& L : m.layers) max_main = std::max(max_main, L.stride * (size_t) ne);
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     const size_t reserve = (size_t) 768 << 20;
@@ -2893,7 +2909,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
-    const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
+    const bool staging_main_only = std::getenv("STRATA_Q36_STAGING_MAIN_ONLY") != nullptr;
+    E.staging_main_only = staging_main_only;
+    const size_t stage_layer = staging_main_only ? max_main : max_layer;
+    const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (stage_layer + kMmqTail) : 0;
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
@@ -3021,8 +3040,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
         for (int b = 0; b < 2; ++b) {
-            CK(cudaMalloc(&E.stage[b], max_layer + kMmqTail));
-            CK(cudaMemset(E.stage[b], 0, max_layer + kMmqTail));
+            CK(cudaMalloc(&E.stage[b], stage_layer + kMmqTail));
+            CK(cudaMemset(E.stage[b], 0, stage_layer + kMmqTail));
             CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&E.ev_used[b], cudaEventDisableTiming));
             CK(cudaEventRecord(E.ev_used[b], E.st));
@@ -3040,6 +3059,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                  "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
                  pinned ? "pinned" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
                  (double) staging / (1 << 30), ms_since(t0) / 1000.0);
+    if (staging && staging_main_only)
+        std::fprintf(stderr, "strata-q36: STRATA_Q36_STAGING_MAIN_ONLY=1: the expert stream's staging is sized for "
+                     "the main layers only (%.0f MiB a buffer); the MTP block's prompt rows run on the CPU pool\n",
+                     (double) (stage_layer + kMmqTail) / (1 << 20));
     return true;
 #endif
 }
