@@ -3108,11 +3108,25 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
     }
     const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
-    CK(cudaHostAlloc((void**) &E.h_h, T * N * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.cpu_out, T * Kp * N * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_ids, T * Kp * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_miss, T * Kp * 4, cudaHostAllocDefault));
-    CK(cudaHostAlloc((void**) &E.h_cnt, all.size() * (size_t) ne * 4, cudaHostAllocDefault));
+    // the pool path's host buffers: pinned when the system has the RAM, pageable when it does not (a pinned
+    // allocation failing here killed the start on a busy machine; pageable copies work, a little slower)
+    const auto pinned_or_pageable = [&err](void** pp, size_t bytes, const char* what) -> bool {
+        if (cudaHostAlloc(pp, bytes, cudaHostAllocDefault) == cudaSuccess) return true;
+        (void) cudaGetLastError();
+        *pp = std::malloc(bytes);
+        if (!*pp) {
+            err = std::string("no host memory for ") + what;
+            return false;
+        }
+        std::fprintf(stderr, "strata-q36: %s fell back to pageable host memory (the pinned allocation failed - the "
+                     "system is short on RAM; the pool path is a little slower)\n", what);
+        return true;
+    };
+    if (!pinned_or_pageable((void**) &E.h_h, T * N * 4, "the hybrid rows' activations")) return false;
+    if (!pinned_or_pageable((void**) &E.cpu_out, T * Kp * N * 4, "the CPU experts' outputs")) return false;
+    if (!pinned_or_pageable((void**) &E.h_ids, T * Kp * 4, "the hybrid rows' expert ids")) return false;
+    if (!pinned_or_pageable((void**) &E.h_miss, T * Kp * 4, "the hybrid rows' miss flags")) return false;
+    if (!pinned_or_pageable((void**) &E.h_cnt, all.size() * (size_t) ne * 4, "the experts' CPU counts")) return false;
     CK(cudaMalloc(&E.ecpu, T * Kp * N * 4));
     CK(cudaMalloc(&E.d_miss, T * Kp * 4));
     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
