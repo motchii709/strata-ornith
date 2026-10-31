@@ -1481,12 +1481,14 @@ struct Engine {
         }
         sess.resize((size_t) n_sess);
         gsets.resize((size_t) n_sess);
-        {   // the sessions' caches: said before they fail (a slot's K / V at the context, fp32, for the attention layers and
-            // the MTP block, and its recurrent state)
+        size_t sess_bytes = 0;   // the sessions' caches in all (said in the context line below)
+        {   // the sessions' caches: said before they fail (a slot's K / V at the context, fp32 or fp16, for the
+            // attention layers and the MTP block, and its recurrent state)
             size_t n_attn = m->has_mtp ? 1 : 0, n_gdn = 0;
             for (const Layer& L : m->layers) (L.attn ? n_attn : n_gdn) += 1;
-            const size_t per = (size_t) (g.n_head_kv * g.head_dim * 2 * 4) * (size_t) ctx * n_attn +
+            const size_t per = (size_t) (g.n_head_kv * g.head_dim * 2 * (kv_f16 ? 2u : 4u)) * (size_t) ctx * n_attn +
                                (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
+            sess_bytes = per * (size_t) n_sess;
             size_t fr0 = 0, tot0 = 0;
             CK(cudaMemGetInfo(&fr0, &tot0));
             if (n_sess > 1)
@@ -1538,8 +1540,9 @@ struct Engine {
         CK(cudaDeviceSynchronize());   // every legacy-stream cudaMemset of the buffers above is done
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
-        std::fprintf(stderr, "strata-q36: context %d cells, prompt chunk %d%s, %.2f GiB of VRAM free\n", ctx, tmax,
-                     m->has_mtp ? ", MTP block loaded" : "", (double) fr / (1 << 30));
+        std::fprintf(stderr, "strata-q36: context %d cells, prompt chunk %d%s, %.2f GiB of VRAM free, the sessions' "
+                     "caches %.0f MiB\n", ctx, tmax, m->has_mtp ? ", MTP block loaded" : "", (double) fr / (1 << 30),
+                     (double) sess_bytes / (1 << 20));
     }
 
     /// The recurrent state and the cache to a fresh sequence.
@@ -3014,11 +3017,25 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                          "slices now\n", (double) freed / (1 << 20), (double) shown / (1 << 20));
         }
         if (need > fr) {
-            err = "not enough VRAM left for the hybrid experts' buffers and slots (" + std::to_string((need >> 20)) +
-                  " MiB needed, " + std::to_string(fr >> 20) + " MiB free after the weights, the context and the sessions): use "
-                  "fewer slots (\"parallel\" / --batch), a shorter --max-context" +
-                  (slots > 0 ? ", or fewer --expert-slots" : "");
-            return false;
+            // WDDM's free counter lags what the process really owns: the give-back above showed 0 of its 288
+            // MiB, and on this card the counter reads ~0 through the whole start-up while the driver serves
+            // fine. The driver knows: a probe allocation of the whole need succeeds when the fit is real, and
+            // the placement's own allocations reuse the same pages right after.
+            void* probe = nullptr;
+            if (cudaMalloc(&probe, need) == cudaSuccess) {
+                CK(cudaFree(probe));
+                std::fprintf(stderr, "strata-q36: the VRAM free counter is %d MiB short of the hybrid fit (%d "
+                             "needed, %d counted free), but a probe allocation of the need succeeded - WDDM's "
+                             "free reading lags the process's reusable pages; going ahead\n",
+                             (int) ((need - fr) >> 20), (int) (need >> 20), (int) (fr >> 20));
+            } else {
+                cudaGetLastError();   // the probe's failure is this refusal, not a crash
+                err = "not enough VRAM left for the hybrid experts' buffers and slots (" + std::to_string((need >> 20)) +
+                      " MiB needed, " + std::to_string(fr >> 20) + " MiB free after the weights, the context and the "
+                      "sessions; a probe allocation of the need failed too): use fewer slots (\"parallel\" / --batch), "
+                      "a shorter --max-context" + (slots > 0 ? ", or fewer --expert-slots" : "");
+                return false;
+            }
         }
     }
     // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
