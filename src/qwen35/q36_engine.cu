@@ -1268,6 +1268,9 @@ struct Engine {
     uint8_t* stage[2] = {};
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
+    /// STRATA_Q36_STAGING_BUFFERS=1: one staging buffer, so the expert copy and the MMQ run take turns -
+    /// half the staging VRAM for a little copy/compute overlap per layer.
+    int n_staging = 2;
     std::vector<int> stream_seq;   // the state indices a streamed forward visits, in order
     int stream_pos = 0;
     long long hy_cpu = 0, hy_gpu = 0, hy_swaps = 0;   // entries computed on the CPU / GPU, slot replacements
@@ -2178,7 +2181,7 @@ struct Engine {
     void stream_begin(const std::vector<int>& seq) {
         stream_seq = seq;
         stream_pos = 0;
-        for (int i = 0; i < 2 && i < (int) seq.size(); ++i) stream_kick(i);
+        for (int i = 0; i < n_staging && i < (int) seq.size(); ++i) stream_kick(i);
     }
     void stream_kick(int i) {   // the i-th layer of the sequence into staging buffer i % 2, after its last reader
         if (staging_main_only && stream_seq[(size_t) i] >= (int) m->layers.size()) {
@@ -2186,7 +2189,7 @@ struct Engine {
                          "but the MTP layer was queued for the stream\n");
             std::exit(1);
         }
-        const int b = i % 2;
+        const int b = i % n_staging;
         const Layer& L = layer_at(stream_seq[(size_t) i]);
         CK(cudaStreamWaitEvent(cst, ev_used[b], 0));
         // the experts with a VRAM slot come from it (device to device, at VRAM speed), only the others over PCIe; runs
@@ -2224,14 +2227,14 @@ struct Engine {
             std::fprintf(stderr, "strata-q36: the expert stream is out of step (layer %d)\n", li);
             std::exit(1);
         }
-        const int b = stream_pos % 2;
+        const int b = stream_pos % n_staging;
         CK(cudaStreamWaitEvent(st, ev_copy[b], 0));
         return stage[b];
     }
     void stream_done() {
-        const int b = stream_pos % 2;
+        const int b = stream_pos % n_staging;
         CK(cudaEventRecord(ev_used[b], st));
-        if (stream_pos + 2 < (int) stream_seq.size()) stream_kick(stream_pos + 2);
+        if (stream_pos + n_staging < (int) stream_seq.size()) stream_kick(stream_pos + n_staging);
         ++stream_pos;
     }
 
@@ -2911,8 +2914,13 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
     const bool staging_main_only = std::getenv("STRATA_Q36_STAGING_MAIN_ONLY") != nullptr;
     E.staging_main_only = staging_main_only;
+    const int n_staging = [] {
+        const char* v = std::getenv("STRATA_Q36_STAGING_BUFFERS");
+        return v && std::atoi(v) == 1 ? 1 : 2;
+    }();
+    E.n_staging = n_staging;
     const size_t stage_layer = staging_main_only ? max_main : max_layer;
-    const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (stage_layer + kMmqTail) : 0;
+    const size_t staging = E.use_mmq && E.main_hybrid ? (size_t) n_staging * (stage_layer + kMmqTail) : 0;
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
@@ -3039,7 +3047,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
     if (staging) {
         CK(cudaStreamCreateWithFlags(&E.cst, cudaStreamNonBlocking));
-        for (int b = 0; b < 2; ++b) {
+        for (int b = 0; b < E.n_staging; ++b) {
             CK(cudaMalloc(&E.stage[b], stage_layer + kMmqTail));
             CK(cudaMemset(E.stage[b], 0, stage_layer + kMmqTail));
             CK(cudaEventCreateWithFlags(&E.ev_copy[b], cudaEventDisableTiming));
@@ -3059,10 +3067,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                  "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
                  pinned ? "pinned" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
                  (double) staging / (1 << 30), ms_since(t0) / 1000.0);
-    if (staging && staging_main_only)
-        std::fprintf(stderr, "strata-q36: STRATA_Q36_STAGING_MAIN_ONLY=1: the expert stream's staging is sized for "
-                     "the main layers only (%.0f MiB a buffer); the MTP block's prompt rows run on the CPU pool\n",
-                     (double) (stage_layer + kMmqTail) / (1 << 20));
+    if (staging && (staging_main_only || n_staging != 2))
+        std::fprintf(stderr, "strata-q36: the expert stream: %d staging buffer(s) of %.0f MiB%s\n", n_staging,
+                     (double) (stage_layer + kMmqTail) / (1 << 20),
+                     staging_main_only ? " (STRATA_Q36_STAGING_MAIN_ONLY=1: the MTP block's prompt rows run on the "
+                                        "CPU pool)"
+                                       : " (STRATA_Q36_STAGING_BUFFERS=1: the copy and the MMQ run take turns)");
     return true;
 #endif
 }
