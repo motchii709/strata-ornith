@@ -3052,6 +3052,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             CK(cudaEventRecord(E.ev_used[b], E.st));
         }
     }
+    // the pool path's device-side output and miss flags too (the whole fit the check validated, taken while hot)
+    CK(cudaMalloc(&E.ecpu, (size_t) E.tmax * m.top_k * g.n_embd * 4));
+    CK(cudaMalloc(&E.d_miss, (size_t) E.tmax * m.top_k * 4));
     // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
     size_t host = 0;
     for (Layer* L : all)
@@ -3068,6 +3071,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     }
     size_t off = 0;
     E.hy.resize(all.size());
+    for (size_t li = 0; li < all.size(); ++li) CK(cudaMalloc(&E.hy[li].slot_of_d, (size_t) ne * 4));   // before the
+    // minutes of copies: the fit the check validated is taken while the driver's pages are hot (see the staging)
     for (size_t li = 0; li < all.size(); ++li) {
         Layer& L = *all[li];
         if (mtp_only && &L != &m.mtp) {   // a main layer: every expert in VRAM, as in the all-in-VRAM placement
@@ -3099,7 +3104,6 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             H.exp_in_slot[(size_t) s] = s;
         }
         H.score.assign((size_t) ne, 0.0);
-        CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
         CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
         if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
         if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
@@ -3127,8 +3131,6 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (!pinned_or_pageable((void**) &E.h_ids, T * Kp * 4, "the hybrid rows' expert ids")) return false;
     if (!pinned_or_pageable((void**) &E.h_miss, T * Kp * 4, "the hybrid rows' miss flags")) return false;
     if (!pinned_or_pageable((void**) &E.h_cnt, all.size() * (size_t) ne * 4, "the experts' CPU counts")) return false;
-    CK(cudaMalloc(&E.ecpu, T * Kp * N * 4));
-    CK(cudaMalloc(&E.d_miss, T * Kp * 4));
     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
     E.pool = std::make_unique<C::ExpertPool>(threads);
