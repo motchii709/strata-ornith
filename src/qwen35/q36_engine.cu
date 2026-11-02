@@ -3059,51 +3059,40 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     size_t host = 0;
     for (Layer* L : all)
         if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
+    // The pin is taken one layer at a time, in the sizes the placement actually uses. A single block of the whole
+    // arena no longer fits the driver's pin budget on this box (measured 2026-11-02: one 10.22 GiB block failed
+    // while a single 8 GiB block and then 40 of 41 layer-sized blocks pinned, so the budget sits right around the
+    // arena's size; on 10-31 the same code pinned the whole arena in one block).
+    // All-or-nothing, as the supervisor specified: if every layer pins, the placement uses the pinned blocks; if a
+    // layer fails, every block is released and the whole arena goes pageable - never a half-pinned mix. Either way
+    // the log records how far the pin reached and the driver's error.
+    std::vector<uint8_t*> pin_blocks;
+    size_t pinned_bytes = 0;
+    int pin_done = 0, pin_total = 0;
+    cudaError_t pin_res = cudaSuccess;
+    for (Layer* L : all) {
+        if (mtp_only && L != &m.mtp) continue;
+        ++pin_total;
+        uint8_t* p = nullptr;
+        pin_res = cudaHostAlloc((void**) &p, L->stride * (size_t) ne + kMmqTail, cudaHostAllocDefault);
+        if (pin_res != cudaSuccess) break;
+        pin_blocks.push_back(p);
+        ++pin_done;
+        pinned_bytes += L->stride * (size_t) ne + kMmqTail;
+    }
+    bool pinned = pin_done > 0 && pin_done == pin_total;
+    if (pinned)
+        std::fprintf(stderr, "strata-q36: the experts' host arena: every layer pinned (%d blocks, %.2f GiB)\n",
+                     pin_done, (double) pinned_bytes / (1024.0 * 1024.0 * 1024.0));
+    else
+        std::fprintf(stderr, "strata-q36: the experts' host arena: pinning reached %d of %d layers (%.2f GiB) before "
+                     "failing (%s, code %d) - the whole arena goes pageable\n",
+                     pin_done, pin_total, (double) pinned_bytes / (1024.0 * 1024.0 * 1024.0),
+                     cudaGetErrorName(pin_res), (int) pin_res);
     uint8_t* arena = nullptr;
-    cudaError_t pin_res = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault);
-    bool pinned = pin_res == cudaSuccess;
     if (!pinned) {
-        // diagnose before falling back: why the driver refuses the one big block, and how much it pins right now
-        // (measured 2026-11-02: the pin fails with plenty of free RAM - idle ~13.7 GiB, a fresh boot - so the
-        // reason is not the amount alone; these probes separate the driver's single-block ceiling from a
-        // layer-by-layer ceiling and name the error for the record)
-        std::fprintf(stderr, "strata-q36: the experts' host arena: one pinned block of %.2f GiB failed (%s, code %d) - the placement falls back to pageable host memory\n",
-                     (double) host / (1024.0 * 1024.0 * 1024.0), cudaGetErrorName(pin_res), (int) pin_res);
-        size_t biggest = 0;
-        for (size_t mb : {8192, 6144, 4096, 3072, 2048, 1536, 1024, 512, 256, 128}) {
-            void* p = nullptr;
-            if (cudaHostAlloc(&p, mb << 20, cudaHostAllocDefault) == cudaSuccess) {
-                cudaFreeHost(p);
-                biggest = mb;
-                break;
-            }
-            (void) cudaGetLastError();
-        }
-        if (biggest) std::fprintf(stderr, "strata-q36: pin probe: the largest block the driver pins right now is %zu MiB\n", biggest);
-        else std::fprintf(stderr, "strata-q36: pin probe: even a 128 MiB pinned block fails right now\n");
-        {
-            // layer-by-layer with the blocks held: measures how much of the arena the driver locks cumulatively
-            std::vector<void*> held;
-            int done = 0, total = 0;
-            size_t bytes = 0;
-            cudaError_t lres = cudaSuccess;
-            for (Layer* L : all) {
-                if (mtp_only && L != &m.mtp) continue;
-                ++total;
-                held.emplace_back();
-                lres = cudaHostAlloc(&held.back(), L->stride * (size_t) ne + kMmqTail, cudaHostAllocDefault);
-                if (lres != cudaSuccess) {
-                    held.pop_back();
-                    break;
-                }
-                ++done;
-                bytes += L->stride * (size_t) ne + kMmqTail;
-            }
-            for (void* p : held) cudaFreeHost(p);
-            if (!held.empty()) (void) cudaGetLastError();
-            std::fprintf(stderr, "strata-q36: pin probe: layer-by-layer pinning reached %d of %d layers (%.2f GiB) before stopping (%s, code %d)\n",
-                         done, total, (double) bytes / (1024.0 * 1024.0 * 1024.0), cudaGetErrorName(lres), (int) lres);
-        }
+        for (uint8_t* p : pin_blocks) cudaFreeHost(p);
+        pin_blocks.clear();
         (void) cudaGetLastError();
         arena = (uint8_t*) std::malloc(host);
         if (!arena) {
@@ -3111,7 +3100,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             return false;
         }
     }
-    size_t off = 0;
+    size_t off = 0, hb = 0;
     E.hy.resize(all.size());
     for (size_t li = 0; li < all.size(); ++li) CK(cudaMalloc(&E.hy[li].slot_of_d, (size_t) ne * 4));   // before the
     // minutes of copies: the fit the check validated is taken while the driver's pages are hot (see the staging)
@@ -3128,8 +3117,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             L.n_slots = (int) ne;
             continue;
         }
-        L.hblobs = arena + off;
-        off += L.stride * (size_t) ne + kMmqTail;
+        if (pinned) {
+            L.hblobs = pin_blocks[hb++];
+        } else {
+            L.hblobs = arena + off;
+            off += L.stride * (size_t) ne + kMmqTail;
+        }
         std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
         for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
         L.n_slots = S;
