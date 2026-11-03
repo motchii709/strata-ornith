@@ -3056,9 +3056,21 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     CK(cudaMalloc(&E.ecpu, (size_t) E.tmax * m.top_k * g.n_embd * 4));
     CK(cudaMalloc(&E.d_miss, (size_t) E.tmax * m.top_k * 4));
     // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
+    // STRATA_Q36_NO_MTP_ARENA=1: with no drafts (--mtp 0) the MTP block never runs, so its experts can stay out of
+    // the host arena (0.80 GiB on UD-Q4_K_XL) - the pin then covers the 40 main layers only (measured 2026-11-03,
+    // 4 GB card, MMQ: 40 of 41 blocks pinned and the 41st - the MTP block - failed, so 40 blocks is a size the
+    // driver has taken in the very boots that failed at 41)
+    bool no_mtp_arena = false;
+    if (!mtp_only && m.has_mtp && std::getenv("STRATA_Q36_NO_MTP_ARENA") != nullptr) {
+        if (E.mtp_d == 0) no_mtp_arena = true;
+        else std::fprintf(stderr, "strata-q36: STRATA_Q36_NO_MTP_ARENA needs --mtp 0 (the block runs for the drafts); "
+                          "keeping the MTP block in the arena\n");
+    }
     size_t host = 0;
-    for (Layer* L : all)
+    for (Layer* L : all) {
+        if (no_mtp_arena && L == &m.mtp) continue;
         if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
+    }
     // The pin is taken one layer at a time, in the sizes the placement actually uses. A single block of the whole
     // arena no longer fits the driver's pin budget on this box (measured 2026-11-02: one 10.22 GiB block failed
     // while a single 8 GiB block and then 40 of 41 layer-sized blocks pinned, so the budget sits right around the
@@ -3071,6 +3083,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     int pin_done = 0, pin_total = 0;
     cudaError_t pin_res = cudaSuccess;
     for (Layer* L : all) {
+        if (no_mtp_arena && L == &m.mtp) continue;
         if (mtp_only && L != &m.mtp) continue;
         ++pin_total;
         uint8_t* p = nullptr;
@@ -3106,6 +3119,19 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // minutes of copies: the fit the check validated is taken while the driver's pages are hot (see the staging)
     for (size_t li = 0; li < all.size(); ++li) {
         Layer& L = *all[li];
+        if (no_mtp_arena && &L == &m.mtp) {   // no drafts: the block never runs, its experts stay pageable and unread
+            L.hblobs = (uint8_t*) std::malloc(L.stride * (size_t) ne + kMmqTail);
+            if (!L.hblobs) {
+                err = "no host memory for the MTP block's experts";
+                return false;
+            }
+            L.n_slots = 0;
+            Engine::Hy& Hm = E.hy[li];
+            Hm.slot_of.assign((size_t) ne, -1);
+            Hm.score.assign((size_t) ne, 0.0);
+            CK(cudaMemcpy(Hm.slot_of_d, Hm.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
+            continue;
+        }
         if (mtp_only && &L != &m.mtp) {   // a main layer: every expert in VRAM, as in the all-in-VRAM placement
             CK(cudaMalloc(&L.blobs, L.stride * (size_t) ne + kMmqTail));
             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) ne + kMmqTail));
@@ -3180,6 +3206,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                  "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
                  pinned ? "pinned" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
                  (double) staging / (1 << 30), ms_since(t0) / 1000.0);
+    if (no_mtp_arena)
+        std::fprintf(stderr, "strata-q36: the MTP block's experts (%.2f GiB) are outside the arena "
+                     "(STRATA_Q36_NO_MTP_ARENA=1 with --mtp 0: the block never runs without drafts)\n",
+                     (double) (m.mtp.stride * (size_t) ne) / (1 << 30));
     if (staging && (staging_main_only || n_staging != 2))
         std::fprintf(stderr, "strata-q36: the expert stream: %d staging buffer(s) of %.0f MiB%s\n", n_staging,
                      (double) (stage_layer + kMmqTail) / (1 << 20),
