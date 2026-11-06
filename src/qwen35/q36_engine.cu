@@ -1305,6 +1305,15 @@ struct Engine {
     cudaEvent_t db_probe = nullptr; // the ring wait's flush (recorded after each publish)
     uint32_t db_expected = 0; // the ring this forward waits for (reset with the ring, so it never wraps)
     long long db_served = 0; // layers served through the doorbell (the exit line)
+    // STRATA_Q36_DECODE_DOORBELL=2: on top of the mapped handoff, each hybrid layer's decode body is captured as a
+    // graph PAIR - pre (attention, router, publish, resident experts, shared expert) and post (the pool's merge and
+    // the combine) - so a token is 2 graph launches + the host's pool work per layer instead of ~15 bare launches.
+    // The capture sweep runs no kernels (a capture records launches), so the model's state is untouched and it can
+    // happen at any first decode token. session.cpp's session_capture / session_loop is the proven pattern.
+    bool db2_on = false;
+    bool db2_capt = false; // inside a capture sweep (the host's pool work is skipped, the merge still recorded)
+    bool hy_merge = false; // moe_hybrid_host found missed entries (the merge launches in moe_hybrid_merge)
+    std::vector<cudaGraphExec_t> db_pre_gx, db_post_gx; // one pair per layer (hybrid layers only)
     uint8_t* stage[2] = {};
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
@@ -1933,17 +1942,28 @@ struct Engine {
         }
     }
 
-    /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
+    /// The layer's two halves for the decode doorbell's graph split: pre runs to the shared expert (its last launch is
+/// the publish), post is the pool's merge and the combine. LayAll is the plain one-shot layer.
+enum LayPhase { LayAll, LayPre, LayPost };
+/// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
     /// `li` indexes the layer's state; positions *dpos .. + T - 1 (device), p0 the same on the host (eager grids);
     /// `verify`: a verify window - the GDN state is read, not written (commit() writes it for the kept rows).
     void layer(const Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
-               const float* wn, float* hout) {
+               const float* wn, float* hout, LayPhase ph = LayAll) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
-        db_tok = db_on && T == 1 && !graph_mode; // the decode doorbell: one token, eager (see the members' note)
+        db_tok = db_on && T == 1 && (!graph_mode || db2_capt); // the decode doorbell: one token; the graph split's capture runs with graph_mode on (see the members' note)
         const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, D = (int) g.ssm_state_size;
         const int C = (int) g.ssm_conv_channels;
         const int H = (int) g.n_head, HKV = (int) g.n_head_kv, HD = (int) g.head_dim;
+        // shared between the pre and the post half (the doorbell's graph split reads them in both)
+        const bool one = T == 1;
+        const bool ext = one || (fast_k && std::getenv("STRATA_Q36_NO_EXT") == nullptr && !verify_k && T <= kGemmT && g.n_expert == 256 && Kp == 8);
+        const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid ||
+        (staging_main_only && li == m->layers.size()));
+        const int64_t n_ent = (int64_t) T * Kp;
+        const int32_t* prow = nullptr;
+        if (ph != LayPost) {
         if (!L.attn) {
             float* qkv_b = verify ? v_qkv[li] : qkv;
             float* hc_b = verify ? v_hc[li] : hc;
@@ -2077,21 +2097,11 @@ struct Engine {
         }
         add_rms_post(L, T);
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
-        const bool one = T == 1;
-        // a decode batch of up to 8 rows takes the router and the shared expert's gate in one product too (rows of 257) when the fused
-        // router follows; the prompt chunks and the checks keep the separate products
-        const bool ext = one || (fast_k && std::getenv("STRATA_Q36_NO_EXT") == nullptr && !verify_k && T <= kGemmT && g.n_expert == 256 && Kp == 8);
         if (ext) f32mm(L.router_ext, h, logits_r, N, (int) g.n_expert + 1, T);
         else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
-        // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
-        // (its prompt pass too: no staging buffers then)
-        const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid ||
-                                         (staging_main_only && li == m->layers.size()));
         const bool mmq_rows = !hy_rows && T > kGemmT && use_mmq;
         if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T, ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
             K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
-        const int64_t n_ent = (int64_t) T * Kp;
-        const int32_t* prow = nullptr;
         if (hy_rows) {
             moe_hybrid_gpu(L, li, T);
         } else if (T > kGemmT && use_mmq) {
@@ -2147,9 +2157,12 @@ struct Engine {
             mm(L.sh_down, shh, sy, T);
         }
         if (!ext) f32mm(L.sh_gate_inp, h, sgate, N, 1, T);
+        }
+        if (ph != LayPre) {
         if (hy_rows) moe_hybrid_cpu(li, T);   // the CPU pool's experts (while the GPU runs the rest), merged
         // the combine, the shared expert's gate, the residual add and the next norm in one launch
         moe_end(T, prow, sy, ext ? logits_r + g.n_expert : sgate, wn, hout, ext ? (int) g.n_expert + 1 : 1);
+        }
     }
 
     /// The main model over T rows (device `tok`, positions p0 .. p0 + T - 1, also at *pos0): hmain gets every row's
@@ -2171,10 +2184,36 @@ struct Engine {
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(x, d_img, d_map, N);   // a picture's cells take its rows
         k_rms<<<T, kThreads, 0, st>>>(x, m->layers[0].attn_norm, h, N, m->eps);   // later layers: from k_moe_out
+        // STRATA_Q36_DECODE_DOORBELL=2: the layer's body as a pre/post graph pair (design §9.3/§9.4). A picture
+        // cell, a verify window and the batch rows' windows keep the eager path; the pairs are captured once, on
+        // the first clean single-session decode token (the capture freezes the layer's host-side branching, so a
+        // mode change afterwards would replay the wrong body).
+        const bool db2_run = db2_on && T == 1 && !verify && !verify_k && !img_active && main_hybrid && !rows_mode &&
+                             !mtab_now && !map_on;
+        if (db2_run) {
+            if (db_pre_gx.size() != m->layers.size()) {
+                db_pre_gx.assign(m->layers.size(), nullptr);
+                db_post_gx.assign(m->layers.size(), nullptr);
+                db2_capture(T, p0, pos0);
+            }
+            // the capture froze the routed publish in the pre graph and the merge in the post graph; the host's
+            // half (moe_hybrid_host) reads this flag now
+            db_tok = true;
+        }
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const bool last = l + 1 == m->layers.size();
-            layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
-                  last ? hmain : h);
+            const float* wn = last ? m->out_norm : m->layers[l + 1].attn_norm;
+            float* hout = last ? hmain : h;
+            if (db2_run) {
+                // pre (attention, router, publish, resident experts) -> the probe -> the host's pool work -> post
+                // (the merge, the combine): two graph launches and one event instead of ~15 launches and 3 waits
+                db2_graph(db_pre_gx[l], [&] { layer(m->layers[l], l, T, p0, pos0, true, false, wn, hout, LayPre); });
+                CK(cudaEventRecord(db_probe, st));
+                moe_hybrid_host(l, T);
+                db2_graph(db_post_gx[l], [&] { layer(m->layers[l], l, T, p0, pos0, true, false, wn, hout, LayPost); });
+            } else {
+                layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, wn, hout);
+            }
         }
         if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
     }
@@ -2321,7 +2360,7 @@ struct Engine {
             // copies and the route event are gone, and the host's wait (moe_hybrid_cpu) can start as soon as the
             // ring lands - which it does while the GPU still runs this layer's resident work
             K::doorbell_publish(h, ids, ewts, N, Kp, db_x_d, db_ids_d, nullptr, db_seq_d, st);
-            CK(cudaEventRecord(db_probe, st));
+            if (!db2_capt) CK(cudaEventRecord(db_probe, st)); // a capture drops events: the probe is recorded outside
         } else
 #endif
         {
@@ -2421,14 +2460,17 @@ struct Engine {
         return 0;
 #endif
     }
-    /// The CPU half: the entries without a slot on the pool (ggml-cpu's arithmetic for the layer's formats), their
-    /// rows uploaded and merged into the entries' rows.
-    void moe_hybrid_cpu(size_t li, int T) {
+    /// The CPU half's host part: the ring (or the route event), the job build, the pool. The merge that consumes
+    /// the pool's rows is moe_hybrid_merge - separate so the graph split can capture it into the post graph.
+    void moe_hybrid_host(size_t li, int T) {
 #if defined(STRATA_Q36_CPU_POOL)
-        const auto& g = m->g;
-        const int N = (int) g.n_embd;
-        const int n_ent = T * (int) m->top_k;
+        hy_merge = false;
+        if (db2_capt) { // a capture records launches and runs nothing: no payload to serve, but the merge follows
+            hy_merge = true;
+            return;
+        }
                 const bool ringed = db_tok;
+        const int n_ent = T * (int) m->top_k;
         if (ringed) {
             // the ring: a volatile read of the mapped sequence word, with the probe event's query as the driver
             // flush. session.cpp's loop: on this driver a device write to mapped pinned memory only becomes
@@ -2461,7 +2503,24 @@ struct Engine {
         if (n_miss == 0) return;
         pool->run_split_multi_native(hy[li].fmt, jobs.data(), (int) jobs.size());
         hy_cpu_ms += ms_since(t0);
-        if (ringed) {
+        hy_merge = true; // the merge follows (in moe_hybrid_merge, or as the post graph's first node)
+#else
+        (void) li;
+        (void) T;
+#endif
+    }
+    /// The CPU half's device part: the pool's rows merged into the entries' rows (a no-op when nothing was missed).
+    /// Under the graph split the merge is a captured node (captured with db_tok on), so it reads the mapped answer
+    /// directly; in the plain decode the rows were uploaded host-to-device.
+    void moe_hybrid_merge(size_t li, int T) {
+#if defined(STRATA_Q36_CPU_POOL)
+        (void) li;
+        const auto& g = m->g;
+        const int N = (int) g.n_embd;
+        const int n_ent = T * (int) m->top_k;
+        if (!hy_merge)
+            return; // nothing missed this layer (a capture forces it so the node lands in the post graph)
+        if (db_tok) {
             // the merge reads the mapped answer and the miss flags directly (the host wrote them before this
             // launch; a kernel over mapped pinned memory is the whole handoff - no host-to-device copies)
             k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, db_d_out, db_d_miss, N);
@@ -2474,6 +2533,11 @@ struct Engine {
         (void) li;
         (void) T;
 #endif
+    }
+    /// The CPU half in one go (the eager modes): the host part, then the merge.
+    void moe_hybrid_cpu(size_t li, int T) {
+        moe_hybrid_host(li, T);
+        moe_hybrid_merge(li, T);
     }
 
     /// The slots to the experts the routing used most (the counts halved each time): at most max_swaps replacements
@@ -2546,6 +2610,12 @@ struct Engine {
         for (auto& kv : row_graphs)
             if (kv.second) CK(cudaGraphExecDestroy(kv.second));
         row_graphs.clear();
+        for (cudaGraphExec_t& g : db_pre_gx)
+            if (g) { CK(cudaGraphExecDestroy(g)); g = nullptr; }
+        for (cudaGraphExec_t& g : db_post_gx)
+            if (g) { CK(cudaGraphExecDestroy(g)); g = nullptr; }
+        db_pre_gx.clear();
+        db_post_gx.clear();
     }
 
     template <class F> void graph_run(cudaGraphExec_t& gx, F body) {
@@ -2559,6 +2629,39 @@ struct Engine {
             CK(cudaGraphDestroy(graph));
         }
         CK(cudaGraphLaunch(gx, st));
+    }
+    /// The doorbell phase 2 pair's launcher (session.cpp's pattern): no use_graph gate - the hybrid decode forces
+    /// use_graph off, and these graphs exist only for the pair path. An empty slot captures, then launches.
+    template <class F> void db2_graph(cudaGraphExec_t& gx, F body) {
+        if (!gx) {
+            cudaGraph_t graph = nullptr;
+            CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+            body();
+            CK(cudaStreamEndCapture(st, &graph));
+            CK(cudaGraphInstantiate(&gx, graph, 0));
+            CK(cudaGraphDestroy(graph));
+        }
+        CK(cudaGraphLaunch(gx, st));
+    }
+    /// The capture sweep: every hybrid layer's pre and post half as a graph pair, recorded with graph_mode on and
+    /// the host's pool work skipped (db2_capt). A capture registers launches and runs nothing, so the model's state
+    /// is untouched and this can run before the first decoded token; layer() then freezes db_tok (on) and the merge
+    /// node into the post graph. One sweep, then the pairs replay for every token.
+    void db2_capture(int T, int64_t p0, const int32_t* dpos) {
+        CK(cudaStreamSynchronize(st));
+        db2_capt = true;
+        for (size_t l = 0; l < m->layers.size(); ++l) {
+            const bool last = l + 1 == m->layers.size();
+            const Layer& L = m->layers[l];
+            const float* wn = last ? m->out_norm : m->layers[l + 1].attn_norm;
+            float* hout = last ? hmain : h;
+            db2_graph(db_pre_gx[l], [&] { layer(L, l, T, p0, dpos, true, false, wn, hout, LayPre); });
+            db2_graph(db_post_gx[l], [&] { layer(L, l, T, p0, dpos, true, false, wn, hout, LayPost); });
+        }
+        db2_capt = false;
+        CK(cudaStreamSynchronize(st));
+        std::fprintf(stderr, "strata-q36: the decode doorbell 2: %zu layers captured as pre/post graph pairs\n",
+                     m->layers.size());
     }
 
     // ---- pictures (--vision).  A request with pictures hands the engine its rows (the encoder's, in prompt order), the
@@ -3323,6 +3426,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     {
         const char* db_env = std::getenv("STRATA_Q36_DECODE_DOORBELL");
         if (db_env != nullptr && db_env[0] != '0') {
+            E.db2_on = db_env[0] == '2'; // =2: the layer's decode body captured as a pre/post graph pair
             auto db_map = [](size_t bytes, void** h, void** d, const char* what) {
                 if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
                     std::fprintf(stderr, "strata-q36: the doorbell: cudaHostAlloc(%s) failed\n", what);
@@ -3343,8 +3447,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                 db_map((size_t) T * kp * 4, (void**) &E.db_miss, (void**) &E.db_d_miss, "the miss flags") &&
                 cudaEventCreateWithFlags(&E.db_probe, cudaEventDisableTiming) == cudaSuccess) {
                 E.db_on = true;
-                std::fprintf(stderr, "strata-q36: the decode doorbell (STRATA_Q36_DECODE_DOORBELL=1): the routing and "
-                    "the pool's answer travel through mapped pinned memory, one publish kernel per layer\n");
+                std::fprintf(stderr, "strata-q36: the decode doorbell (STRATA_Q36_DECODE_DOORBELL=%s): the routing "
+                    "and the pool's answer travel through mapped pinned memory, one publish kernel per layer%s\n",
+                    E.db2_on ? "2" : "1",
+                    E.db2_on ? "; each layer's decode body is captured as a pre/post graph pair" : "");
             } else {
                 std::fprintf(stderr, "strata-q36: the decode doorbell is off (a mapped allocation failed): the "
                     "conventional path serves the hybrid layers\n");
@@ -4236,8 +4342,8 @@ int strata::qwen35::run(int argc, char** argv) {
                          "CPU pool in %.0f ms, %lld slot replacements\n", E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0,
                          E.hy_cpu, E.hy_cpu_ms, E.hy_swaps);
             if (E.db_on)
-                std::fprintf(stderr, "strata-q36: the decode doorbell: %lld layer round trips through mapped memory\n",
-                             E.db_served);
+                std::fprintf(stderr, "strata-q36: the decode doorbell: %lld layer round trips through mapped memory%s\n",
+                             E.db_served, E.db2_on ? ", the layers' bodies as pre/post graph pairs" : "");
         }
     } report{E};
     E.reset();
