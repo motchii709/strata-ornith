@@ -23,10 +23,12 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/elementwise.hpp" // doorbell_publish (the decode doorbell's one-kernel handoff)
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/engine.hpp"
 #include "strata/qwen35/sampling.hpp"
+#include "strata/platform/cpu_relax.hpp" // strata_cpu_pause / strata_load_fence (the doorbell's ring wait)
 #include "q36_kernels.cuh"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -1283,6 +1285,26 @@ struct Engine {
     uint8_t* acts = nullptr;   // per token: its quantized activation (kNativeActBytes)
     std::vector<uint8_t> quant_flag;   // the tokens quantized this call (moe_hybrid_jobs: a member, not a per-layer heap vector)
     cudaEvent_t ev_route = nullptr;
+    // STRATA_Q36_DECODE_DOORBELL=1 (T == 1, eager decode - the hybrid mode's own path). The layer's routing payload
+    // goes to mapped pinned memory in ONE kernel (doorbell_publish: the copies, the fence and the ring), the host
+    // waits for the ring with session.cpp's proven volatile read + probe event loop, the pool's answer is written
+    // into mapped memory and merged from it. The two device-to-host copies, the two host-to-device copies and the
+    // route event per layer go away. m0/doorbell-design.md §9. Everything else keeps the conventional path.
+    bool db_on = false; // the mapped regions exist
+    bool db_tok = false; // this layer of this token takes the doorbell (set in layer(): T == 1 and not a graph)
+    float* db_x = nullptr; // n_embd f32: the routed activation (host view)
+    int32_t* db_ids = nullptr; // T * top_k i32: the routed ids (host view)
+    uint32_t* db_seq = nullptr; // 16 words: the ring (host view)
+    float* db_out = nullptr; // T * top_k * n_embd f32: the pool's answer (host view)
+    int32_t* db_miss = nullptr; // T * top_k i32: the miss flags (host view)
+    float* db_x_d = nullptr; // the five regions' device views
+    int32_t* db_ids_d = nullptr;
+    uint32_t* db_seq_d = nullptr;
+    float* db_d_out = nullptr;
+    int32_t* db_d_miss = nullptr;
+    cudaEvent_t db_probe = nullptr; // the ring wait's flush (recorded after each publish)
+    uint32_t db_expected = 0; // the ring this forward waits for (reset with the ring, so it never wraps)
+    long long db_served = 0; // layers served through the doorbell (the exit line)
     uint8_t* stage[2] = {};
     cudaStream_t cst = nullptr;
     cudaEvent_t ev_copy[2] = {}, ev_used[2] = {};
@@ -1918,6 +1940,7 @@ struct Engine {
                const float* wn, float* hout) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
+        db_tok = db_on && T == 1 && !graph_mode; // the decode doorbell: one token, eager (see the members' note)
         const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, D = (int) g.ssm_state_size;
         const int C = (int) g.ssm_conv_channels;
         const int H = (int) g.n_head, HKV = (int) g.n_head_kv, HD = (int) g.head_dim;
@@ -2135,6 +2158,10 @@ struct Engine {
     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
+        if (db_on && T == 1 && !verify) { // one forward, one set of rings: the ring and the expectation restart together
+            *db_seq = 0u; // (so the count never wraps; the previous forward was synchronized when it read its pick)
+            db_expected = 0;
+        }
         if (main_hybrid && T > hybrid_t && use_mmq) {
             std::vector<int> seq;
             for (size_t l = 0; l < m->layers.size(); ++l)
@@ -2288,9 +2315,20 @@ struct Engine {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k;
         const int64_t n_ent = (int64_t) T * Kp;
-        CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
-        CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
-        CK(cudaEventRecord(ev_route, st));
+#if defined(STRATA_Q36_CPU_POOL)
+        if (db_tok) {
+            // one kernel publishes the routing payload into the mapped regions and rings: the two device-to-host
+            // copies and the route event are gone, and the host's wait (moe_hybrid_cpu) can start as soon as the
+            // ring lands - which it does while the GPU still runs this layer's resident work
+            K::doorbell_publish(h, ids, ewts, N, Kp, db_x_d, db_ids_d, nullptr, db_seq_d, st);
+            CK(cudaEventRecord(db_probe, st));
+        } else
+#endif
+        {
+            CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaEventRecord(ev_route, st));
+        }
         group_entries(L, hy[li].slot_of_d, T);
         if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
         K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
@@ -2390,18 +2428,48 @@ struct Engine {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
         const int n_ent = T * (int) m->top_k;
-        while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
+                const bool ringed = db_tok;
+        if (ringed) {
+            // the ring: a volatile read of the mapped sequence word, with the probe event's query as the driver
+            // flush. session.cpp's loop: on this driver a device write to mapped pinned memory only becomes
+            // host-visible when the driver is entered, so the query is the mechanism, not a fallback.
+            const uint32_t want = ++db_expected;
+            volatile uint32_t* const seq = db_seq;
+            for (;;) {
+                const cudaError_t q = cudaEventQuery(db_probe);
+                if (*seq >= want) break;
+                if (q == cudaSuccess) break;
+                if (q != cudaErrorNotReady) {
+                    std::fprintf(stderr, "strata-q36: the doorbell's probe query failed at layer %zu: %s\n", li,
+                                 cudaGetErrorString(q));
+                    std::exit(1);
+                }
+                strata_cpu_pause();
+            }
+            strata_load_fence(); // the payload (x, ids) is read after the ring (a no-op on x86)
+            ++db_served;
+        } else {
+            while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
+                strata_cpu_pause();
+            }
         }
         const auto t0 = Clock::now();
-        const int n_miss = moe_hybrid_jobs(li, T, h_ids, h_h, cpu_out, h_miss);
+        const int n_miss = ringed ? moe_hybrid_jobs(li, T, db_ids, db_x, db_out, db_miss)
+                                  : moe_hybrid_jobs(li, T, h_ids, h_h, cpu_out, h_miss);
         hy_cpu += n_miss;
         hy_gpu += n_ent - n_miss;
         if (n_miss == 0) return;
         pool->run_split_multi_native(hy[li].fmt, jobs.data(), (int) jobs.size());
         hy_cpu_ms += ms_since(t0);
-        CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
-        k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
+        if (ringed) {
+            // the merge reads the mapped answer and the miss flags directly (the host wrote them before this
+            // launch; a kernel over mapped pinned memory is the whole handoff - no host-to-device copies)
+            k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, db_d_out, db_d_miss, N);
+        } else {
+            CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
+            k_merge_cpu<<<n_ent, kThreads, 0, st>>>(eparts, ecpu, d_miss, N);
+        }
 #else
         (void) li;
         (void) T;
@@ -3250,6 +3318,39 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (!pinned_or_pageable((void**) &E.h_cnt, all.size() * (size_t) ne * 4, "the experts' CPU counts")) return false;
     E.acts = (uint8_t*) std::malloc(T * C::kNativeActBytes + 64);
     CK(cudaEventCreateWithFlags(&E.ev_route, cudaEventDisableTiming));
+    // STRATA_Q36_DECODE_DOORBELL=1: the decode doorbell's mapped regions (m0/doorbell-design.md §9). The
+    // conventional buffers stay allocated either way; a failure here only reports and the conventional path serves.
+    {
+        const char* db_env = std::getenv("STRATA_Q36_DECODE_DOORBELL");
+        if (db_env != nullptr && db_env[0] != '0') {
+            auto db_map = [](size_t bytes, void** h, void** d, const char* what) {
+                if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                    std::fprintf(stderr, "strata-q36: the doorbell: cudaHostAlloc(%s) failed\n", what);
+                    return false;
+                }
+                if (cudaHostGetDevicePointer(d, *h, 0) != cudaSuccess) {
+                    std::fprintf(stderr, "strata-q36: the doorbell: cudaHostGetDevicePointer(%s) failed\n", what);
+                    return false;
+                }
+                std::memset(*h, 0, bytes);
+                return true;
+            };
+            const size_t kp = (size_t) Kp, nb = (size_t) N;
+            if (db_map(nb * 4, (void**) &E.db_x, (void**) &E.db_x_d, "the routed activation") &&
+                db_map((size_t) T * kp * 4, (void**) &E.db_ids, (void**) &E.db_ids_d, "the routed ids") &&
+                db_map(64, (void**) &E.db_seq, (void**) &E.db_seq_d, "the ring") &&
+                db_map((size_t) T * kp * nb * 4, (void**) &E.db_out, (void**) &E.db_d_out, "the pool's answer") &&
+                db_map((size_t) T * kp * 4, (void**) &E.db_miss, (void**) &E.db_d_miss, "the miss flags") &&
+                cudaEventCreateWithFlags(&E.db_probe, cudaEventDisableTiming) == cudaSuccess) {
+                E.db_on = true;
+                std::fprintf(stderr, "strata-q36: the decode doorbell (STRATA_Q36_DECODE_DOORBELL=1): the routing and "
+                    "the pool's answer travel through mapped pinned memory, one publish kernel per layer\n");
+            } else {
+                std::fprintf(stderr, "strata-q36: the decode doorbell is off (a mapped allocation failed): the "
+                    "conventional path serves the hybrid layers\n");
+            }
+        }
+    }
     E.pool = std::make_unique<C::ExpertPool>(threads);
     CK(cudaDeviceSynchronize());
     if (mtp_only)
@@ -4134,6 +4235,9 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr, "strata-q36: hybrid experts: %lld of %lld batch entries on the GPU (%.1f%%), %lld on the "
                          "CPU pool in %.0f ms, %lld slot replacements\n", E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0,
                          E.hy_cpu, E.hy_cpu_ms, E.hy_swaps);
+            if (E.db_on)
+                std::fprintf(stderr, "strata-q36: the decode doorbell: %lld layer round trips through mapped memory\n",
+                             E.db_served);
         }
     } report{E};
     E.reset();
