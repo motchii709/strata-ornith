@@ -1281,6 +1281,7 @@ struct Engine {
     float *h_h = nullptr, *cpu_out = nullptr, *ecpu = nullptr;
     int32_t *h_ids = nullptr, *h_miss = nullptr, *d_miss = nullptr, *h_cnt = nullptr;
     uint8_t* acts = nullptr;   // per token: its quantized activation (kNativeActBytes)
+    std::vector<uint8_t> quant_flag;   // the tokens quantized this call (moe_hybrid_jobs: a member, not a per-layer heap vector)
     cudaEvent_t ev_route = nullptr;
     uint8_t* stage[2] = {};
     cudaStream_t cst = nullptr;
@@ -2295,9 +2296,11 @@ struct Engine {
         K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
                                  std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
     }
-    /// The CPU half: the entries without a slot on the pool (ggml-cpu's arithmetic for the layer's formats), their
-    /// rows uploaded and merged into the entries' rows.
-    void moe_hybrid_cpu(size_t li, int T) {
+    /// The CPU half's job build, shared with the decode doorbell: the entries without a slot become pool jobs (up
+    /// to MAXT tokens per job), their activations quantized on the host, the miss flags written. `hh` the f32
+    /// expert input, `ids` the routing; `out` / `miss` where the pool's rows and the flags land (the conventional
+    /// path's pinned buffers, the doorbell path's mapped ones). Returns the missed entries.
+    int moe_hybrid_jobs(size_t li, int T, const int32_t* ids, const float* hh, float* out, int32_t* miss) {
 #if defined(STRATA_Q36_CPU_POOL)
         namespace C = strata::kernels::cpu;
         const auto& g = m->g;
@@ -2305,46 +2308,96 @@ struct Engine {
         const int n_ent = T * Kp;
         Hy& H = hy[li];
         const Layer& L = layer_at((int) li);
-        while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
-        }
-        const auto t0 = Clock::now();
         // the missed entries per expert (up to MAXT tokens per job)
         jobs.clear();
-        std::vector<char> quantized((size_t) T, 0);
+        if ((int) quant_flag.size() < T) quant_flag.assign((size_t) T, 0);
+        else std::fill(quant_flag.begin(), quant_flag.begin() + T, (uint8_t) 0);
         int n_miss = 0;
-        std::map<int, size_t> open;   // expert -> its job with room
+        // expert -> its job with room. Decode's few misses take a fixed array and a linear scan (a map node per
+        // call costs more than the scan); a prompt batch's many distinct experts fall back to the map.
+        constexpr int kOpenFixed = 64;
+        const bool use_map = n_ent > kOpenFixed;
+        std::map<int, size_t> open;
+        struct OpenFix {
+            int e;
+            size_t j;
+        } open_fix[kOpenFixed];
+        int n_open = 0;
         const bool defer = rows_deferred && li < m->layers.size();
         if (defer) {
             if (row_ids.size() < m->layers.size()) row_ids.resize(m->layers.size());
-            row_ids[li].assign(h_ids, h_ids + n_ent);
+            row_ids[li].assign(ids, ids + n_ent);
         }
         for (int e = 0; e < n_ent; ++e) {
-            const int x = h_ids[e];
+            const int x = ids[e];
             if (!defer) H.score[(size_t) x] += 1.0;
-            h_miss[e] = H.slot_of[(size_t) x] < 0;
-            if (!h_miss[e]) continue;
+            miss[e] = H.slot_of[(size_t) x] < 0;
+            if (!miss[e]) continue;
             ++n_miss;
             const int t = e / Kp;
-            if (!quantized[(size_t) t]) {
-                C::native_quant_act(H.fmt, h_h + (size_t) t * N, acts + (size_t) t * C::kNativeActBytes);
-                quantized[(size_t) t] = 1;
+            if (!quant_flag[(size_t) t]) {
+                C::native_quant_act(H.fmt, hh + (size_t) t * N, acts + (size_t) t * C::kNativeActBytes);
+                quant_flag[(size_t) t] = 1;
             }
-            auto it = open.find(x);
-            if (it == open.end() || jobs[it->second].nt == C::MAXT) {
+            size_t ji = 0;
+            bool have = false;
+            if (use_map) {
+                auto it = open.find(x);
+                if (it != open.end() && jobs[it->second].nt < C::MAXT) {
+                    ji = it->second;
+                    have = true;
+                }
+            } else {
+                for (int i = 0; i < n_open; ++i)
+                    if (open_fix[i].e == x && jobs[open_fix[i].j].nt < C::MAXT) {
+                        ji = open_fix[i].j;
+                        have = true;
+                        break;
+                    }
+            }
+            if (!have) { // no job with room for x (a filled fixed-array entry stays, the room check skips it)
                 C::ExpertJobMulti j;
                 j.blob = L.hblobs + (size_t) x * L.stride;
                 jobs.push_back(j);
-                it = open.insert_or_assign(x, jobs.size() - 1).first;
+                ji = jobs.size() - 1;
+                if (use_map) open.insert_or_assign(x, ji);
+                else if (n_open < kOpenFixed) { // distinct experts <= n_ent <= kOpenFixed here, so this always fits
+                    open_fix[n_open].e = x;
+                    open_fix[n_open].j = ji;
+                    ++n_open;
+                }
             }
-            C::ExpertJobMulti& j = jobs[it->second];
+            C::ExpertJobMulti& j = jobs[ji];
             j.nact[j.nt] = acts + (size_t) t * C::kNativeActBytes;
-            j.out[j.nt] = cpu_out + (size_t) e * N;
+            j.out[j.nt] = out + (size_t) e * N;
             ++j.nt;
         }
+        return n_miss;
+#else
+        (void) li;
+        (void) T;
+        (void) ids;
+        (void) hh;
+        (void) out;
+        (void) miss;
+        return 0;
+#endif
+    }
+    /// The CPU half: the entries without a slot on the pool (ggml-cpu's arithmetic for the layer's formats), their
+    /// rows uploaded and merged into the entries' rows.
+    void moe_hybrid_cpu(size_t li, int T) {
+#if defined(STRATA_Q36_CPU_POOL)
+        const auto& g = m->g;
+        const int N = (int) g.n_embd;
+        const int n_ent = T * (int) m->top_k;
+        while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
+        }
+        const auto t0 = Clock::now();
+        const int n_miss = moe_hybrid_jobs(li, T, h_ids, h_h, cpu_out, h_miss);
         hy_cpu += n_miss;
         hy_gpu += n_ent - n_miss;
         if (n_miss == 0) return;
-        pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
+        pool->run_split_multi_native(hy[li].fmt, jobs.data(), (int) jobs.size());
         hy_cpu_ms += ms_since(t0);
         CK(cudaMemcpyAsync(ecpu, cpu_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_miss, h_miss, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
