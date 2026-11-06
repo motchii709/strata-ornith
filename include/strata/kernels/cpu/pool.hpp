@@ -272,6 +272,9 @@ public:
         repark = ms_repark_;
     }
 
+    /// Whether `STRATA_POOL_FUSED_PHASES` took effect (the NUMA split disables it - see the member's note).
+    bool fused() const { return fused_; }
+
     /// **A PARKED WORKER SPINS FOR THIS LONG, THEN SLEEPS.**  The park is a `_mm_pause` spin because a layer's
     /// batches are microseconds apart and a wake-up from the OS costs more than that.  But a spin that never ends
     /// keeps every worker's core at 100% while the engine waits for a request - issue #4, "CPU 50% even when
@@ -341,6 +344,13 @@ private:
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
+    /// STRATA_POOL_FUSED_PHASES: a non-NUMA `run_phase` skips its two `wait_parked` barriers and keeps only the
+    /// real dependency, `wait_done`. `wait_done(n)` already guarantees no task of the previous batch is in
+    /// flight (a claim without an increment would leave `done_` short), and the epoch tag makes a stale claim
+    /// fail, so the parked waits are double insurance there. Under the NUMA split they are not: the slice's
+    /// stamp is written after its last `done` increment, and the re-park is what makes it visible - the flag
+    /// stays off when the split is on.
+    bool fused_ = false;
     // The sleep after `kSpinBeforeSleep`.  `sleepers_` is how `publish` knows whether anyone needs waking, so the
     // token path pays one uncontended load per publish and never takes the mutex while the workers spin.
     alignas(64) std::atomic<uint32_t> sleepers_{0};

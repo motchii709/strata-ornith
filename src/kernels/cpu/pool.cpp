@@ -909,6 +909,18 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
             std::fprintf(stderr, "strata cpu pool: NUMA split off: %s\n", plan.why.c_str());
         }
     }
+    // STRATA_POOL_FUSED_PHASES=1: a non-NUMA `run_phase` drops its two `wait_parked` barriers and keeps only
+    // `wait_done` (see the member's note in the header). Read here, with the split already settled, because
+    // the two features do not combine - under the split the re-park is what makes the slice's stamp visible.
+    if (const char* fu = std::getenv("STRATA_POOL_FUSED_PHASES"); fu != nullptr && *fu == '1') {
+        fused_ = numa_n_ == 0;
+        if (fused_)
+            std::fprintf(stderr, "strata cpu pool: fused phases on: a phase skips its parked waits and keeps "
+                "only the done wait (STRATA_POOL_FUSED_PHASES=1)\n");
+        else
+            std::fprintf(stderr, "strata cpu pool: fused phases off: the NUMA split is on, the two features do "
+                "not combine - the phases run as before\n");
+    }
     if (n_workers > 0) {
         // recommend, never force: a count above what this CPU uses well runs as configured, with a plain warning
         // (STRATA_NUMA_SPLIT on: workers on the other socket are the point, that case is not warned about)
@@ -1287,8 +1299,13 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     // The same three phases `run()` times, accumulated the same way (the `ms_*_` members). The q36 decode
     // reaches the pool through `run_split_multi_native` -> here, and until now its barrier share was folded
     // into the callers' whole-call totals, so it was invisible in the phase display.
+    //
+    // STRATA_POOL_FUSED_PHASES: a non-NUMA phase skips the two parked waits (the header note has the argument)
+    // and keeps only `wait_done`, the real dependency. `ms_wait_park_` then reads as the time the phase entry
+    // took without a parked wait, and `ms_repark_` as nothing.
+    const bool skip_parked = fused_ && !numa_phase();
     const auto t_a = std::chrono::steady_clock::now();
-    wait_parked("before a phase");
+    if (!skip_parked) wait_parked("before a phase");
     const auto t_b = std::chrono::steady_clock::now();
     mode_ = mode;
     njobs_ = n_tasks;
@@ -1296,7 +1313,7 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     if (host_works_) drain(-1, host_scratch_, e);
     wait_done(n_tasks);
     const auto t_c = std::chrono::steady_clock::now();
-    wait_parked("after a phase");
+    if (!skip_parked) wait_parked("after a phase");
     // Each slice's stamp is stored after its last `done` increment, so `wait_done` can return before it lands; the
     // thread that stored it has parked again since (it left the park to claim), and that re-park is what the wait
     // above acquired.  So the stamps are read here, not in `wait_done`.
