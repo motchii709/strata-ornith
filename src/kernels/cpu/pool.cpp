@@ -1284,12 +1284,18 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
+    // The same three phases `run()` times, accumulated the same way (the `ms_*_` members). The q36 decode
+    // reaches the pool through `run_split_multi_native` -> here, and until now its barrier share was folded
+    // into the callers' whole-call totals, so it was invisible in the phase display.
+    const auto t_a = std::chrono::steady_clock::now();
     wait_parked("before a phase");
+    const auto t_b = std::chrono::steady_clock::now();
     mode_ = mode;
     njobs_ = n_tasks;
     const uint32_t e = begin_batch(n_tasks);
     if (host_works_) drain(-1, host_scratch_, e);
     wait_done(n_tasks);
+    const auto t_c = std::chrono::steady_clock::now();
     wait_parked("after a phase");
     // Each slice's stamp is stored after its last `done` increment, so `wait_done` can return before it lands; the
     // thread that stored it has parked again since (it left the park to claim), and that re-park is what the wait
@@ -1301,6 +1307,10 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
         }
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    const auto t_d = std::chrono::steady_clock::now();
+    ms_wait_park_ += std::chrono::duration<double, std::milli>(t_b - t_a).count();
+    ms_drain_ += std::chrono::duration<double, std::milli>(t_c - t_b).count();
+    ms_repark_ += std::chrono::duration<double, std::milli>(t_d - t_c).count();
 }
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
